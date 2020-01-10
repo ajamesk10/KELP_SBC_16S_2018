@@ -2,7 +2,7 @@
 title: "KELP03_06_16S_2018_GitHub"
 author: "James"
 date: "1/9/2020"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
