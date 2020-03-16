@@ -12,4 +12,4 @@ This work was conducted by AK James, CJ English, N Nidzieko, CA Carlson, and EG 
 
 *Information about code:*
 
-This code processes pre-trimmed (w/o primers) sequences through the DADA2 pipeline and then uses Phyloseq to visualize the data. I have also included an admittedly (really) clunky script, following the Phyloseq analysis, for visualizing and analyzing 16S sequences.
+This code processes pre-trimmed (w/o primers) sequences through the DADA2 pipeline and then uses an admittedly (really) clunky script to visualize and statistically analyze these 16S sequences.
