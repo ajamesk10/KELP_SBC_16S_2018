@@ -1,0 +1,1232 @@
+---
+title: "KELP03to06_GiantKelpMicrobiome_16S_2018"
+author: "James"
+date: "11/27/2018"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script processes raw sequence reads from Davis. Davis removes primers, so this script processess pre-trimmed (w/o primers) sequences through the dada2 pipeline and then uses phylosey to visualize the data. I have also included an admittedly (really) clunky script, following phyloseq, for visualizing and analyzing 16S sequences. My motivation here is that I am not certain what phyloseq is 'doing' at all times and wanted to have full control over visualizations and statistical analyses. I have endeavered to annotate everything so that it is somewhat less painful to make sense of.
+
+# Dada2 Pipeline
+
+## 1. Load Packages
+```{r}
+library(dada2); packageVersion("dada2")
+```
+
+## 2. Import Data
+
+Save a path to the directory with a COPY of your unzipped fastq files that you will work with. And make sure there are no zipped files in this directory!
+
+SAVE FILES TO ANOTHER DIRECTORY THAT YOU NEVER DIRECTLY WORK WITH
+
+Specify path to working directory:
+```{r}
+path <- "~/Desktop/kelp_dom/sequencing/kelp03_06_16s_nov18/kelp03_06_16s_nov18_processing"
+```
+
+Store names of forward and reverse files as lists:
+```{r}
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+```
+
+## 3. Inspect read quality profiles
+
+We start by visualizing the quality profiles of the forward reads:
+```{r}
+plotQualityProfile(fnFs[1:3])
+```
+
+In grey-scale - heat map of the frequency of each quality score at each base position. Green line - median quality score at each position and the quartiles of the quality score distribtuion are the orange lines. 
+
+The forward reads tend to be better quality than the reverse reads - dada2 advises trimming the last few nucleotides to avoid less well-controlled errors that tend to be more abundant at the end of the reads. 
+
+Want Phred scores (Y-axis) above 30, generally. So in this case, only need to truncate forward reads a few nuclotides - stick with 240?
+
+Visualize quality profiles of reverse reads:
+```{r}
+plotQualityProfile(fnRs[1:3])
+```
+
+## 4. Filtering and Trimming
+
+Get sample names, assuming files named as follows: SAMPLENAME_XXX.fastq
+Define the basename of fnFs as the first part of each fastq file name until "_L"; apply this to all samples
+
+```{r}
+sample.names <- sapply(strsplit(basename(fnFs), "_L"), `[`,1)
+```
+
+Create a "filtered" folder in the working directory as a place to put all the new filtered files
+```{r}
+filt_path <- file.path(path, "filtered")
+```
+
+Add the approriate designation string to any new files made that will be put into the "filtered" folder
+```{r}
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq"))
+```
+
+This is the actual filtering step
+
+dada2 generally advises trimming the last few nucleotides for weird sequence errors that can pop up there.
+
+Details of code: 
+truncLen: sets the minimum size to trim the forward and reverse reads in order to keep the Phred quality scores roughly above 30
+
+maxN: removes all sequences containing any Ns
+
+maxEE: quality filtering threshold being applied - in this case, throwing the read away if it is likely to have more than 2 erroneous base calls. The c(2,2) is specifying this for both the forward and reverse reads separately.
+
+truncQ: trims all bases after the first quality score of 2 it comes across in a read
+
+multithread: runs the program in parallel if set to TRUE, or you can specify the number of cores to run
+
+This code uses standard filtering parameters: maxN=0 (DADA2 requires no ambiguous bases (Ns)), truncQ=2 and maxEE=2.
+
+```{r}
+# change the truncLen based on quality plots above!
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(200,160),  maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE, compress=TRUE, multithread=TRUE)
+```
+
+Look at the output - this tells you how many reads were removed.
+```{r}
+readsinout <- out
+```
+
+## 5. Learn the Error Rates
+
+From dada2 online tutorial: "The dada2 algorithm makes use of a parametric error model (err) and every amplicon dataset has a different set of error rates. learnErrors method learns this error model from the data by alternating estimation of the error rates and inference of sample composition until they converge on a jointly consistent solution. As in many machine-learning problems, the alogrith must begin with an initial guess, for which the max possible errors in this data are used (the error rates if only the most abundant sequence is correct and all the rest are errors)."
+
+```{r}
+errF <- learnErrors(filtFs, multithread = TRUE)
+errR <- learnErrors(filtRs, multithread = TRUE)
+```
+
+Vusialize estimated error rates
+```{r}
+plotErrors(errF, nominalQ=TRUE)
+```
+
+From dada2 online tutorial: "The error rates for each possible transition (A-->C, A-->G,...) are shown in these plots. Points are the observed error rates for each consensus quality score. The black line shows the estimatedd error rates after convergence of the maching-learning algorith. The red line shows the error rates expected under the nominal definition of the Q-score. Here the estimated error rates (black line) are a good fit to the observed rates (points), and the error rates drop with increased quality as expected."
+
+
+## 6. Dereplication
+
+Dereplication combines all identical sequences into "unique sequences" with a corresponding "abundance" equal to the number of reads with that unique sequence. This substantially reduces computation time.
+
+One crucial difference between dada2 and other pipelines: dada2 retains a summary of the quality information associated with each unique sequence. This is the consensus quality profile - these inform the error model of the subsequent sample inference step and significantly increases dada2's accuracy
+
+```{r}
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+```
+
+Name the derep-class objects by the sample names
+```{r}
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+```
+
+
+## 7. Infer the sequence variance
+
+Now we are ready to apply the core sample inference algorithm to dereplicated data:
+```{r}
+dadaFs <- dada(derepFs, err=errF, multithread = TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread = TRUE)
+```
+
+Inspect the returned dada-class object:
+```{r}
+dadaFs[[1]]
+```
+
+Save the error values:
+```{r}
+saveRDS(dadaFs, "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16S_nov18_processing/dadaFS_N.rds")
+saveRDS(dadaRs, "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16S_nov18_processing/dadaRS_N.rds")
+```
+
+
+## 8. Merge paired reads
+
+Merge the forward and reverse reads together. This is done by aligning the denoised forward read with the reverse-complement of the corresponding denoised reverse reads --> this is now the "contig" sequence. Merged sequences only output if forward and reverse reads overlap by ≥12 bases, and are identical to one another in the overlapping region.
+
+Merge reads:
+```{r}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+Save the merged reads:
+```{r}
+saveRDS(mergers, "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16S_nov18_processing/dada_merged.rds")
+```
+
+
+## 9. Construct sequence table
+
+Now construct an amplicon sequence variant table (ASV) - analogous to an OTU table:
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+
+Inspect the distribution of sequence lengths:
+```{r}
+table(nchar(getSequences(seqtab)))
+```
+
+
+## 10. Remove Chimeras
+
+These are two or more biological sequences that attached to each other during PCR and polymerase built a non-biological sequence. There are artifacts that need to be removed.
+
+Remove:
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+```
+
+Check the proportion of sequences that are not chimeras:
+```{r}
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+Save the dataset without chimeras:
+```{r}
+saveRDS(seqtab.nochim, "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16S_nov18_processing/dadaFs_Nseqtab.nochim.rds")
+```
+
+## 11. Track reads through the pipeline
+
+Look at the number of reads that made it through each step in the pipeline:
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+
+## 12. Assign Taxonomy 
+
+Dowload the silva_nr_v132_train_set.fa file, and place it in the directory with the fastq files:
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16S_nov18_processing/filtered/silva_nr_v132_train_set.fa", multithread=TRUE)
+```
+
+Save the datafile:
+```{r}
+saveRDS(taxa, "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16S_nov18_processing/taxa.rds")
+```
+
+Create a table out of the taxa data (one with the sequences and assignments, one with all the taxa):
+```{r}
+write.table(cbind(t(seqtab.nochim) , taxa), "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16S_nov18_processing/seqtab-nochimtaxa.txt", sep="\t", row.names=TRUE, col.names=NA, quote=FALSE)
+write.table(taxa,"~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16S_nov18_processing/taxa.txt", sep="\t", row.names=TRUE, col.names=NA, quote=FALSE)
+```
+
+
+# Analyzing Processed Sequences
+
+Ok, bear with me. Here is where things get (especially) clunky. What I have endeavored to accomplish here is essentially everything one could do in Phyloseq, but outside of Phyloseq. Why, you might ask??! Welp, becuase I'm apparently insane... And, because I couldn't figure out if and when Phyloseq was applying transformations to my data. So, to know as much as I could about what was happening to my data before conducting statistical analyses, I wrote the following brain-numbing code... god speed!
+
+Load packages:
+```{r}
+library("dplyr")
+library("ape")
+library("ggplot2")
+library("gplots")
+library(lme4)
+library(vegan)
+library("VennDiagram")
+library("tidyverse")
+library("reshape2")
+```
+
+
+*Load dataframes:*
+
+First, we need a dataframe with counts per ASV (this is similar to an OTU table):
+```{r}
+# Sequence counts by ASV ID
+count_tab <- read.table(as.matrix("~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16S_nov18_processing/seqtab-nochimtaxa.txt", header=T, row.names=1, check.names=F))
+```
+
+Second, we need to load a dataframe with information about the samples:
+```{r}
+# Metadata
+sample_info_tab <- read.table("~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16S_nov18_processing/sampleinfo.txt", header=T, row.names=1, check.names=F)
+```
+
+Third, we need a matrix with all leves of taxonomic identifications:
+```{r}
+# Taxa ids
+tax_tab <- as.matrix(read.table(as.matrix("~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16S_nov18_processing/taxa.txt", header=T, row.names=1, check.names=F, na.strings="", sep="\t")))
+```
+
+Next, I removed taxa names and samples from the count_tab_subset:
+```{r}
+count_tab_subset <- select(count_tab, kelp03_S01_N_1_2_S99:kelp06_S08_W_S171)
+```
+
+## 1. Load and Clean Data
+
+Create a subsetted df with desired samples, containing ASVs as row names, seq count data, and all levels of taxa ids:
+```{r}
+all_taxa <- as.data.frame(tax_tab) # convert tax_tab from matrix to df
+all_taxa_count_df <- cbind(count_tab_subset, all_taxa) # combine these two df
+```
+
+Remove Eukaryotes, Chloroplasts, and Mitochondria from all_taxa_count_df:
+```{r}
+# remove eukaryotes from df
+bact_arch_counts <- all_taxa_count_df %>% filter(Kingdom != "Eukaryota" & Order != "Chloroplast" & Family != "Mitochondria")
+```
+
+In order to calculate relative abundance, you need to aggregate the bact_arch_counts df by the desired taxonomy level. Create the combined taxa columns here so that you may aggregate by different levels later:
+```{r}
+# Create a column with combined class, order, and family, taxa IDs, separated by '_'
+bact_arch_counts$c_o_f <- do.call(paste, c(bact_arch_counts[c("Class", "Order", "Family")], sep="_"))
+
+# Create a column with combined kingdom and phylym taxa IDs, separated by '_'
+bact_arch_counts$k_p <- do.call(paste, c(bact_arch_counts[c("Kingdom", "Phylum")], sep="_"))
+
+# Use 'ifelse' to create a column with taxa IDs that include Class_Order_Family, or, if these are all NA, paste Kingdom_Phylum IDs
+bact_arch_counts$taxa.ids <- ifelse(bact_arch_counts$c_o_f == "NA_NA_NA", bact_arch_counts$k_p, bact_arch_counts$c_o_f)
+```
+
+*Aggregate by Family Level*
+First, need to convert Family level NAs to higher level unknowns (e.g. Unknown Alphaproteobacteria) so that these can be aggregated and summed appropriately:
+```{r}
+# Aggregate by Family ID:
+agg_by_fam <- aggregate(bact_arch_counts[,1:93], 
+                        by = list(bact_arch_counts$taxa.ids), 
+                        FUN = sum)
+```
+
+May need to convert NAs in Family IDs to 'Unknown'
+See information here: (https://datascience.stackexchange.com/questions/14273/how-to-replace-na-values-with-another-value-in-factors-in-r):
+```{r}
+# levels <- levels(all_taxa_count_tab$Family)
+# levels[length(levels) + 1] <- "Unknown Family"
+# all_taxa_count_tab$Family <- factor(all_taxa_count_tab$Family, levels = levels)
+# all_taxa_count_tab$Family[is.na(all_taxa_count_tab$Family)] <- "Unknown Family"
+```
+
+*Aggregate by Class level*
+Same as for Family Level aggregations above but create IDs to Class level:
+```{r}
+# Create a column with combined Kingdom_Phylum_Class:
+bact_arch_counts$k_p_c <- do.call(paste, c(bact_arch_counts[c("Kingdom", "Phylum", "Class")], sep="_"))
+
+# Aggregate by Class ID:
+agg_by_class <- aggregate(bact_arch_counts[,1:93], 
+                          by = list(bact_arch_counts$k_p_c), 
+                          FUN = sum)
+```
+
+
+## 2. Calculate Relative Abundance
+
+*ASV Level*
+Calculate relative abundance by ASVs
+```{r}
+# 1. Create a df of counts with ASVs in a column so that you can subset by ASV IDs:
+all_taxa_count_df_asv <- rownames_to_column(all_taxa_count_df) # for asv analysis
+
+# 2. Create subsetted df using all_taxa_count_df_asv (has ASV names in a column) that removes chloroplasts and eukaryotes:
+asvs_bact_arch_counts_taxa <- all_taxa_count_df_asv %>% filter(Kingdom != "Eukaryota" & Order != "Chloroplast" & Family != "Mitochondria")
+
+# 2B. Output this subsetted df with asv ids and taxa for DEseq analysis
+# write.csv(asvs_bact_arch_counts_taxa, file = "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.RAWCOUNTS.wouteuks.woutchlor.woutmitoch.by.ASV.JAN20.csv")
+
+# 3. Calculate relative abundance by ASV:
+rel.abun.asv <- as.data.frame(lapply(asvs_bact_arch_counts_taxa[2:94], function(x) {(x/ sum(x))*100}))
+
+# 4. Combine ASV IDs and relative abundance and move ASVs to rownames:
+rel.abun.asv.ids <- cbind(asvs_bact_arch_counts_taxa[1], rel.abun.asv) %>% 
+  remove_rownames %>%
+  column_to_rownames(var = "rowname")
+
+# 5. Transpose:
+rel.abun.asv.ids.tr <- t(rel.abun.asv.ids)
+```
+
+Write to csv (re-saved Aug. 2019):
+```{r}
+#write.csv(rel.abun.asv.ids.tr, file = "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.RELABUN.wouteuks.woutchlor.woutmitoch.by.ASV.AUG19.csv")
+```
+
+*Family Level*
+Calculate relative abundance & add Falmiy Level IDs to df:
+```{r}
+# 1. Calculate relative abundance:
+rel.abun.fam1 <- as.data.frame(lapply(agg_by_fam[2:length(agg_by_fam)], function(x) {(x/ sum(x))*100}))
+
+# 2. Combine taxa IDs and relative abundance:
+rel.abun.fam2 <- cbind(agg_by_fam[1], rel.abun.fam1) %>% 
+  remove_rownames %>%
+  column_to_rownames(var = "Group.1")
+
+# 3. Transpose:
+rel.abun.fam2.tr <- data.frame(t(rel.abun.fam2))
+```
+
+write to csv (re-saved Aug. 2019):
+```{r}
+#write.csv(rel.abun.fam2.tr, file = "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.RELABUN.wouteuks.woutchlor.woutmitochon.by.FAMILY.AUG.19.csv")
+```
+
+*Class Level*
+Calculate relative abundance & add Class Level IDs to df:
+```{r}
+# 1. Calculate relative abundance:
+rel.abun.class1 <- as.data.frame(lapply(agg_by_class[2:length(agg_by_class)], function(x) {(x/ sum(x))*100}))
+
+# 2. Combine taxa IDs and relative abundance:
+rel.abun.class2 <- cbind(agg_by_class[1], rel.abun.class1) %>% 
+  remove_rownames %>%
+  column_to_rownames(var = "Group.1")
+
+# 3. Transpose:
+rel.abun.class2.tr <- data.frame(t(rel.abun.class2))
+```
+
+Write to csv (re-saved Aug. 2019):
+```{r}
+#write.csv(rel.abun.class2.tr, file = "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.RELABUN.wouteuks.woutchlor.woutmitochon.by.CLASS.csv")
+```
+
+
+## 3. Transform Relative Abundance Data
+
+*ASV Level*
+Arcsine square root transform relative abundance data at ASV level:
+```{r}
+# 1. Arcsine squareroot transform:
+rel.abun.asin.asv <- asin(sqrt(rel.abun.asv.ids/100))
+
+# 2. Add prefix to column names to indicate that this is transformed data:
+colnames(rel.abun.asin.asv) <- paste("asinsqrt", colnames(rel.abun.asin.asv), sep = "_")
+
+# 3. Transpose rel.abun.asin.asv for stats to get samples as rows and asvs as columns:
+asin.asv.tr <- data.frame(t(rel.abun.asin.asv))
+```
+
+Write to csv and manually add factors in excel:
+```{r}
+# write.csv(asin.asv.tr, file = "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.ASIN.RELABUN.wouteuks.woutchlor.woutmitoch.by.ASV.AUG19.csv")
+```
+
+Then reload df with factors:
+```{r}
+# Reload transformed relative abundance data from excel with factors
+asin.relabun.factors.asv <- read.csv("~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.ASIN.RELABUN.wouteuks.woutchlor.woutmitoch.by.ASV.w.factors.AUG19.csv", header=T, check.names=F, row.names=1)
+```
+
+
+*Family Level*
+Arcsine square root transform relative abundance data for statistical analysis:
+```{r}
+# 1. Arcsine squareroot transform:
+rel.abun.asin.fam <- asin(sqrt(rel.abun.fam1/100))
+
+# 2. Combine Family IDs from agg_by_x with transformed relative abundance:
+rel.abun.asin.fam.ids <- cbind(agg_by_fam[1], rel.abun.asin.fam) %>% # 
+  remove_rownames %>% # make row names family ids
+  column_to_rownames(var = "Group.1")
+
+# 3. Add prefix to column names to indicate that this is transformed data:
+colnames(rel.abun.asin.fam.ids) <- paste("asinsqrt", colnames(rel.abun.asin.fam.ids), sep = "_")
+
+# 4. Transpose to have samples as rows and variables as columns for stats:
+asin.fam.tr <- data.frame(t(rel.abun.asin.fam.ids))
+```
+
+Save file to .csv and add factors manually in excel:
+```{r}
+#write.csv(asin.fam.tr, file = "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.ASIN.RELABUN.wouteuks.woutchlor.woutmitoch.by.FAMILY.AUG19.csv")
+```
+
+Reload transformed relative abundance data df from excel, after adding factors (metadata):
+```{r}
+asin.relabun.factors.fam <- read.csv("~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.ASIN.RELABUN.wouteuks.woutchlor.woutmitoch.by.FAMILY.w.factors.AUG19.csv", header=T, check.names=F, row.names=1)
+```
+
+*Class Level*
+Arcsine square root transform for stats:
+```{r}
+# 1. Arcsine squareroot transform:
+rel.abun.asin.class <- asin(sqrt(rel.abun.class1/100))
+
+# 2. Combine Class IDs from agg_by_x with transformed relative abundance:
+rel.abun.asin.class.ids <- cbind(agg_by_class[1], rel.abun.asin.class) %>% # 
+  remove_rownames %>% # make row names family ids
+  column_to_rownames(var = "Group.1")
+
+# 3. Add prefix to column names to indicate that this is transformed data:
+colnames(rel.abun.asin.class.ids) <- paste("asinsqrt", colnames(rel.abun.asin.class.ids), sep = "_")
+
+# 4. Transpose to have samples as rows and variables as columns for stats:
+asin.class.tr <- data.frame(t(rel.abun.asin.class.ids))
+```
+
+Save file to .csv and add factors manually in excel:
+```{r}
+#write.csv(asin.class.tr, file = "~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.ASIN.RELABUN.wouteuks.woutchlor.woutmitoch.by.CLASS.AUG19.csv")
+```
+
+Reload transformed rel abun data df from excel, after adding factors (metadata)
+```{r}
+asin.relabun.factors.class <- read.csv("~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.ASIN.RELABUN.wouteuks.woutchlor.woutmitoch.by.CLASS.w.factors.AUG19.csv", header=T, check.names=F, row.names=1)
+```
+
+## 4. Data Visualizations and Statistical Analyses
+
+### A. Non-metric MultiDimensional Scaling (nMDS) Plots
+
+```{r}
+library(vegan)
+library(ggplot2)
+
+###############################
+# Choose correct taxa level df
+###############################
+# samples by taxa matrix ; samples by taxa matrix with factors
+# asv df: asin.asv.tr ; asin.relabun.factors.asv
+# family df: asin.fam.tr ; asin.relabun.factors.fam
+# class df: asin.class.tr ; asin.relabun.factors.class
+
+# Conduct nMDS using metaMDS (see next lines for proper water sample filtering)
+asv.nmds.all <- metaMDS(asin.asv.tr, distance = "bray", k=2, autotransform = FALSE)
+
+# Filter WATER samples to REMOVE NISKIN AND 1.2um SAMPLES
+asv.surface.water.kelp <- filter(asin.relabun.factors.asv, w_k == "w" | w_k == "k") %>%
+  column_to_rownames('sample.id')
+
+asv.nmds.surf.water.kelp <- metaMDS(asv.surface.water.kelp[,10:length(asv.surface.water.kelp)], distance = "bray", k = 2, autotransform = FALSE)
+
+# Filter kelp samples and re-ordinate
+# asv.kelp1 <- asin.relabun.factors.asv %>%
+  # rownames_to_column('sample.id')
+asv.kelp2 <- filter(asin.relabun.factors.asv, w_k == "k") %>%
+  column_to_rownames('sample.id')
+
+asv.nmds.kelp <- metaMDS(asv.kelp2[,10:length(asv.kelp2)], distance = "bray", k = 2, autotransform = FALSE)
+
+##############
+# Plot NMDS
+##############
+nmds1 <- asv.nmds.surf.water.kelp$points[,1] # extract points for NMDS 1
+nmds2 <- asv.nmds.surf.water.kelp$points[,2] # extract points for NMDS 2
+
+df.trial <- as.data.frame(cbind(nmds1,nmds2))
+
+ggplot() + 
+  geom_point(data = df.trial, 
+             aes(x = nmds1, y = nmds2,
+                 shape = asv.surface.water.kelp$w_k, 
+                 fill = asv.surface.water.kelp$w_k),
+             colour = "black", 
+             size = 8) +
+  theme_bw() +
+  labs(x = "NMDS1", y = "NMDS2") +
+  scale_color_manual(values = c("w" = "#315b96", "k" = "#de6b35")) +
+  scale_shape_manual(values =c(21, 21)) +
+  theme(text = element_text(size=16))
+```
+
+
+### B. Bar Plot
+
+CAN START HERE BY LOADING DF WITH PREVIOUSLY CALCULATED RELATIVE ABUNDANCES W FACTORS!
+
+*1. Load relative abundance df*
+
+Load relative abundance df with factors at *family* level from excel. Also need a df with all taxa levels (including those combined into taxa.ids). I manually add factors to the rel.abun.taxa.tr df in excel and load that here:
+```{r}
+# Rel abun df saved as .csv (re-uploaded Aug 2019)
+relabun.w.factors <- read.csv("~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.RELABUN.wouteuks.woutchlor.woutmitochon.by.FAMILY.w.factors.csv", header=T, check.names=F, row.names=1)
+
+# Also need a taxa df to pair higher order taxa to the taxa.ids in the relabun df
+# can subset the bact_arch_counts by removing count data and retaining higher level taxa ids, as well as the amalgam ids created earlier (e.g. class_order_fam)
+taxa.df <- bact_arch_counts[,94:102] # isolates taxa information from counts
+unique.taxa.df <- subset(taxa.df, !duplicated(taxa.df$taxa.ids)) # subsets unique taxa by taxa.ids (removes duplicates)
+```
+
+*2. Calculate relative abundance by desired groupings*
+
+```{r}
+# Calculate rel abun by environment (water v kelp)
+rel.abun.env <- relabun.w.factors %>%
+  group_by(w_k) %>%
+  summarise_at(vars(-sample.id, -exp, -filt_type, -phys_state, -exp_phys_state, -mock_neg, -kelpbed, -kelpbed_time), funs(mean(., na.rm = TRUE)))
+
+##############################
+ # FIGURE 4 in manuscript ##
+##############################
+# Calculate rel abun with water samples combined, and H versus Bryo for each site (time combined)
+
+# 1. remove niskin and 1.2um water samples so just have surface water and kelp samples:
+subset.water.samples <- filter(relabun.w.factors, w_k == "w" | w_k == "k")
+
+# 2. Now calculate relative abundance by phys_state and kelpbed (na are the water samples)
+rel.abun.phys_state.kelpbed <- subset.water.samples %>%
+  group_by(phys_state, kelpbed) %>%
+  summarise_at(vars(-sample.id, -exp, -w_k, -filt_type, -exp_phys_state, -mock_neg, -kelpbed_time), funs(mean(., na.rm = TRUE)))
+```
+
+*3. Wrangle data*
+
+This chunk of code stacks (melts, in R verbiage) the df into long format and sorts the stacked df by descending relative abundance.
+
+```{r}
+##############################
+ # FIGURE 4 in manuscript ##
+##############################
+# This code melts the rel abun df to long format (stacks df)
+rel.abun.melt <- melt(rel.abun.phys_state.kelpbed, id = c("phys_state", "kelpbed")) # can do id = c(id1, id2)
+
+# sort df by descending order
+rel.abun.sort <- arrange(rel.abun.melt, desc(value))
+```
+
+Next, filter the stacked and ordered df (rel.abun.sort) for taxa that makeup > 1% of total relative abundance:
+
+```{r}
+top.taxa <- as.data.frame(filter(rel.abun.sort, value > 1.0)) # filter taxa > 1%
+```
+
+And replace the column name 'variable' with Family ids:
+```{r}
+names(top.taxa)[3] <- "taxa.ids"
+```
+
+Finally, merge the top taxa ids (top.taxa) with the unique taxa df (unique.taxa.df) to combine higher order taxa with the top taxa ids:
+
+```{r}
+library(data.table) # merge function won't work unless load this here
+top.taxa.merged <- merge(top.taxa, unique.taxa.df, by = "taxa.ids")
+top.taxa.merged.class <- arrange(top.taxa.merged, Class)
+```
+
+*4. Plot Stacked Bar Plot*
+
+Annoyingly, you must "lock in" factor levels prior to plotting in order for ggplot to properly order the data in the stacked bar plot. If you fail to do this, ggplot will stack the taxa by descending relative abundance and you will not be able to group by higher level taxonomy (e.g. all Gammas blue, Alphas red, etc.)
+
+First, ID unique taxa levels
+```{r}
+top.taxa.merged.class$taxa.ids <- factor(top.taxa.merged.class$taxa.ids, levels = unique(top.taxa.merged.class$taxa.ids))
+```
+
+Next, combine phys_state and kelpbed into a single column to decipher between groups:
+```{r}
+top.taxa.merged.class2 <- top.taxa.merged.class %>%
+  unite("combined_ids", phys_state, kelpbed, sep = "_", remove = FALSE)
+```
+
+Now, change the $column.id based on how you would like to group the data. For Figure 4 in the manuscript, the bar plot is ordered by na_mohawk, na_aq, H_mohawk, E_mohawk, H_aq, and E_aq. This is saved as 'x_order':
+```{r}
+top.taxa.merged.class2$x_order <- factor(top.taxa.merged.class2$combined_ids, levels = c("na_mohawk", "na_aq", "H_mohawk","H_aq","E_mohawk","E_aq"))
+```
+
+And, now, order the stacking of the bars:
+```{r}
+top.taxa.merged.class2$y_order <- factor(top.taxa.merged.class2$taxa.ids, levels = c("Acidimicrobiia_Actinomarinales_Actinomarinaceae",  "Alphaproteobacteria_Puniceispirillales_SAR116_clade", "Alphaproteobacteria_Rhodospirillales_Thalassospiraceae", "Alphaproteobacteria_Sphingomonadales_Sphingomonadaceae",  "Alphaproteobacteria_Rhodobacterales_Rhodobacteraceae", "Alphaproteobacteria_Caulobacterales_Hyphomonadaceae",  "Alphaproteobacteria_SAR11_clade_Clade_I", "Alphaproteobacteria_SAR11_clade_Clade_II", "Alphaproteobacteria_SAR11_clade_Clade_IV", "Bacteroidia_Chitinophagales_Saprospiraceae", "Bacteroidia_Flavobacteriales_Crocinitomicaceae", "Bacteroidia_Flavobacteriales_Cryomorphaceae", "Bacteroidia_Cytophagales_Cyclobacteriaceae", "Bacteroidia_Cytophagales_Microscillaceae",  "Bacteroidia_Flavobacteriales_Flavobacteriaceae", "Deinococci_Deinococcales_Trueperaceae", "Deltaproteobacteria_Myxococcales_Haliangiaceae", "Gammaproteobacteria_Alteromonadales_Alteromonadaceae", "Gammaproteobacteria_Alteromonadales_Colwelliaceae", "Gammaproteobacteria_Alteromonadales_Pseudoalteromonadaceae", "Gammaproteobacteria_Alteromonadales_Psychromonadaceae", "Gammaproteobacteria_Arenicellales_Arenicellaceae", "Gammaproteobacteria_Cellvibrionales_Cellvibrionaceae", "Gammaproteobacteria_Oceanospirillales_Marinomonadaceae", "Gammaproteobacteria_Oceanospirillales_Nitrincolaceae", "Gammaproteobacteria_Pseudomonadales_Pseudomonadaceae", "Gammaproteobacteria_Vibrionales_Vibrionaceae", "Gammaproteobacteria_Betaproteobacteriales_Burkholderiaceae", "Gammaproteobacteria_Cellvibrionales_Halieaceae", "Gammaproteobacteria_Alteromonadales_Shewanellaceae", "Gammaproteobacteria_Thiohalorhabdales_Thiohalorhabdaceae", "Gammaproteobacteria_Thiotrichales_Thiotrichaceae", "Oxyphotobacteria_Synechococcales_Cyanobiaceae", "Planctomycetacia_Pirellulales_Pirellulaceae", "Planctomycetacia_Planctomycetales_Rubinisphaeraceae", "Verrucomicrobiae_Opitutales_Puniceicoccaceae", "Verrucomicrobiae_Verrucomicrobiales_Rubritaleaceae"))
+```
+
+Finally, create the bar plot, colored manually, for FIGURE 4:
+```{r}
+ggplot(data = top.taxa.merged.class2, 
+       aes(x = x_order, y = value, fill = factor(taxa.ids, levels=c("Acidimicrobiia_Actinomarinales_Actinomarinaceae",  "Alphaproteobacteria_Puniceispirillales_SAR116_clade", "Alphaproteobacteria_Rhodospirillales_Thalassospiraceae", "Alphaproteobacteria_Sphingomonadales_Sphingomonadaceae",  "Alphaproteobacteria_Rhodobacterales_Rhodobacteraceae", "Alphaproteobacteria_Caulobacterales_Hyphomonadaceae",  "Alphaproteobacteria_SAR11_clade_Clade_I", "Alphaproteobacteria_SAR11_clade_Clade_II", "Alphaproteobacteria_SAR11_clade_Clade_IV", "Bacteroidia_Chitinophagales_Saprospiraceae", "Bacteroidia_Flavobacteriales_Crocinitomicaceae", "Bacteroidia_Flavobacteriales_Cryomorphaceae", "Bacteroidia_Cytophagales_Cyclobacteriaceae", "Bacteroidia_Cytophagales_Microscillaceae",  "Bacteroidia_Flavobacteriales_Flavobacteriaceae", "Deinococci_Deinococcales_Trueperaceae", "Deltaproteobacteria_Myxococcales_Haliangiaceae", "Gammaproteobacteria_Alteromonadales_Alteromonadaceae", "Gammaproteobacteria_Alteromonadales_Colwelliaceae", "Gammaproteobacteria_Alteromonadales_Pseudoalteromonadaceae", "Gammaproteobacteria_Alteromonadales_Psychromonadaceae", "Gammaproteobacteria_Arenicellales_Arenicellaceae", "Gammaproteobacteria_Cellvibrionales_Cellvibrionaceae", "Gammaproteobacteria_Oceanospirillales_Marinomonadaceae", "Gammaproteobacteria_Oceanospirillales_Nitrincolaceae", "Gammaproteobacteria_Pseudomonadales_Pseudomonadaceae", "Gammaproteobacteria_Vibrionales_Vibrionaceae", "Gammaproteobacteria_Betaproteobacteriales_Burkholderiaceae", "Gammaproteobacteria_Cellvibrionales_Halieaceae", "Gammaproteobacteria_Alteromonadales_Shewanellaceae", "Gammaproteobacteria_Thiohalorhabdales_Thiohalorhabdaceae", "Gammaproteobacteria_Thiotrichales_Thiotrichaceae", "Oxyphotobacteria_Synechococcales_Cyanobiaceae", "Planctomycetacia_Pirellulales_Pirellulaceae", "Planctomycetacia_Planctomycetales_Rubinisphaeraceae", "Verrucomicrobiae_Opitutales_Puniceicoccaceae", "Verrucomicrobiae_Verrucomicrobiales_Rubritaleaceae")))) +
+  geom_bar(stat = "identity", color = "black") +
+  scale_fill_manual(values = c("#f2f4f6",
+  "#ffd5d5", "#ffd5d5", "#ffd5d5","palevioletred1","violetred1","#d1274b", "#f0134d", "#f35588", 
+  "#FFFFCC", "#FFFFCC", "#FFFFCC", "#ff9234", "#ffcd3c", "yellow", 
+  "#a2a8d3",
+  "#f2f4f6",
+  "#5eb7b7", "#5eb7b7", "#5eb7b7", "#5eb7b7","#5eb7b7", "#5eb7b7", "#5eb7b7", "#5eb7b7", "#5eb7b7","#5eb7b7", "#00a8cc", "dodgerblue4", "#0c7b93", "#207dff","#7efaff",
+  "#a6cb12",
+  "#f30cd4", "#930077",
+ "#fe5f55", "#ed3833")) +
+  ylab("Relative Abundance (Phyla > 3%) \n") +
+  ylim(0, 100) +
+  ggtitle("Family Composition \nBacterial Communities by Environment") +
+  theme_bw() +
+  theme(text = element_text(size=10)) +
+  theme(axis.text.x = element_text(angle = 90, hjust =1))
+```
+
+
+## 5. Statistical Analyses
+### A. Conducting PERMANOVA
+
+The goal here is to conduct a Permutational Multivariate Analysis of Variance (PERMANOVA) on the arcsine square root transformed relative abundances of ASVs, Family level, and Class level taxa. This is a non-parametric multivariate statistical test used to compare differences in overall community abundances.
+
+Function information: I used the *adonis* function, in the vegan package
+ADONIS Documentation: https://rdrr.io/rforge/vegan/man/adonis.html
+
+adonis(formula, data, permutations = 999, method = "bray", strata = NULL, contr.unordered = "contr.sum", contr.ordered = "contr.poly", parallel = getOption("mc.cores"), ...)
+
+NOTE: I manually added sample factors (metadata) to the arcsine square root transformed relative abundances of ASVs in excel (chloroplasts, mitochondria, and euks previously removed from sequences).
+
+*ASV LEVEL STATS*
+Test effect of environment (water vs kelp) on kelp communities:
+```{r}
+asv.asin.relabun.factors <- read.csv("~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.ASIN.RELABUN.wouteuks.woutchlor.woutmitoch.by.ASV.w.factors.AUG19.csv", header=T, check.names=F, row.names=1)
+
+# Filter out desired samples (in this case, water and kelp samples):
+asv.asin.relabun.surf.water.kelp <- filter(asv.asin.relabun.factors, w_k == "k" | w_k == "w")
+
+# Run the adonis analysis with strata = kelpbed_time (factor with 4 levels) to account for variance by sampling event:
+adonis(asv.asin.relabun.surf.water.kelp[ ,11:length(asv.asin.relabun.surf.water.kelp)] ~ w_k, data=asv.asin.relabun.surf.water.kelp, strata = asv.asin.relabun.surf.water.kelp$kelpbed_time)
+```
+
+Next, test the effects of phys_state on just kelp samples by subsetting the dataframe so looking at just kelp samples and run adonis on desired subset:
+```{r}
+asv.asin.relabun.factors.kelp <- filter(asv.asin.relabun.factors, w_k == "k")
+
+# Now run adonis on subsetted df
+adonis(asv.asin.relabun.factors.kelp[ ,11:length(asv.asin.relabun.factors.kelp)] ~ phys_state, data=asv.asin.relabun.factors.kelp, strata = asv.asin.relabun.factors.kelp$kelpbed_time)
+```
+
+*FAMILY LEVEL STATS*
+Run analysis (PERMANOVA) using adonis function in vegan package, same as above, but for Family level.
+
+Load df with arcsine square root transformed relative abundance with factors (asin.relabun.fam.w.factors):
+```{r}
+asin.relabun.fam.w.factors <- read.csv("~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.ASIN.RELABUN.wouteuks.woutchlor.woutmitoch.by.FAMILY.w.factors.AUG19.csv", header=T, check.names=F, row.names=1)
+```
+
+Run PERMANOVA using adonis (see above for more information on function) to statistically analyze *Family level* differences between water (w) and kelp (k) samples across communities:
+```{r}
+adonis(asin.relabun.fam.w.factors[ ,11:length(asin.relabun.fam.w.factors)] ~ w_k, data=asin.relabun.fam.w.factors)
+```
+
+Next, subset df so only assessing kelp samples:
+```{r}
+asin.relabun.fam.factors.kelp <- filter(asin.relabun.fam.w.factors, w_k == "k")
+```
+
+Run PERMANOVA to assess differences by physiological state (phys_state) for just kelp samples using the asin.relabun.factors.kelp df:
+```{r}
+adonis(asin.relabun.fam.factors.kelp[ ,11:length(asin.relabun.fam.factors.kelp)] ~ phys_state, data=asin.relabun.fam.factors.kelp)
+```
+
+*CLASS LEVEL STATS*
+Run analysis (PERMANOVA) using adonis function in vegan package, same as above, but for Class level.
+
+Load df with arcsine square root transformed relative abundance data with factors (asin.relabun.class.w.factors):
+```{r}
+asin.relabun.class.w.factors <- read.csv("~/Desktop/kelp_dom/sequencing/kelp03_06_16S_nov18/kelp03_06_16s_nov18_processing/kelp03-06.ASIN.RELABUN.wouteuks.woutchlor.woutmitoch.by.CLASS.w.factors.AUG19.csv", header=T, check.names=F, row.names=1)
+```
+
+Run PERMANOVA using adonis (see above for more information on function) to statistically analyze *class-level* differences between water (w) and kelp (k) samples across communities:
+```{r}
+adonis(asin.relabun.class.w.factors[ ,9:length(asin.relabun.class.w.factors)] ~ w_k, data=asin.relabun.class.w.factors)
+```
+
+Next, subset df and run PERMANOVA on just kelp samples:
+```{r}
+# Subset data so only assessing kelp samples
+asin.relabun.class.factors.kelp <- filter(asin.relabun.class.w.factors, w_k == "k")
+
+# Run PERMANOVA to assess differences by physiological state (phys_state) subsetted df (asin.relabun.class.factors.kelp):
+adonis(asin.relabun.class.factors.kelp[ ,9:length(asin.relabun.class.factors.kelp)] ~ phys_state, data=asin.relabun.class.factors.kelp)
+
+# Subset data so only assessing correct water and kelp samples:
+asin.relabun.class.w.factors.water.kelp <- filter(asin.relabun.class.w.factors, w_k == "k" | w_k == "w")
+```
+
+
+### B. Post-hoc tests
+
+Question here is: are there significant differences in specific taxa (Family or Class) by environment (water v kelp) and laminae condition (healthy v bryozoan)?
+
+Based on converstion with Craig N. (Feb 2020), and this amazing tutorial found here: https://arxiv.org/ftp/arxiv/papers/1308/1308.5499.pdf, I decided to use a linear mixed-effects model to assess sig differences at various taxa levels (Family and Class).
+
+I'm running this test on the mean *arcsine square root transformed relative abundance* with euks, mitochondria, and chloroplasts removed from the df.
+
+First, load packages:
+```{r}
+library(lmerTest)
+```
+
+*Family Level Analysis by Laminae Condition (healthy v bryozoan)*
+Melt asin transformed relative abundance dataframe using Family level df:
+```{r}
+asin.relabun.fam.factors.kelp.melt <- reshape2::melt(asin.relabun.fam.factors.kelp, id = c("sample.id", "exp", "w_k", "filt_type", "phys_state", "exp_phys_state", "mock_neg", "location", "month", "kelpbed_time"))
+```
+
+Filter specific Families from dataframe (I chose the top Families exhibiting > 3% relative abundance):
+```{r}
+sapro <- filter(asin.relabun.fam.factors.kelp.melt, variable == "Bacteroidia_Chitinophagales_Saprospiraceae")
+```
+
+Run the lmer model for each Family Level taxa:
+```{r}
+lmer.sapro <- lmer(value ~ phys_state + (1|kelpbed_time), sapro)
+```
+
+Summarize the results from the desired model:
+```{r}
+summary(lmer.sapro)
+```
+
+
+*Class Level Analysis by Water v Kelp*
+
+Melt asin transformed relative abundance dataframe using Class level df and df that INCLUDES water samples:
+```{r}
+asin.relabun.class.factors.melt <- reshape2::melt(asin.relabun.class.w.factors.water.kelp, id = c("sample.id", "exp", "w_k", "filt_type", "phys_state", "exp_phys_state", "mock_neg", "kelpbed_time"))
+```
+
+Filter specific Classes from dataframe (I chose the top Classes exhibiting > 3% relative abundance):
+```{r}
+bacteroidia <- filter(asin.relabun.class.factors.melt, variable == "Bacteria_Bacteroidetes_Bacteroidia")
+
+gammaprot <- filter(asin.relabun.class.factors.melt, variable == "Bacteria_Proteobacteria_Gammaproteobacteria")
+
+alpha <- filter(asin.relabun.class.factors.melt, variable == "Bacteria_Proteobacteria_Alphaproteobacteria")
+
+plancto <- filter(asin.relabun.class.factors.melt, variable == "Bacteria_Planctomycetes_Planctomycetacia")
+
+verruco <- filter(asin.relabun.class.factors.melt, variable == "Bacteria_Verrucomicrobia_Verrucomicrobiae")
+
+oxyphoto <- filter(asin.relabun.class.factors.melt, variable == "Bacteria_Cyanobacteria_Oxyphotobacteria")
+
+delta <- filter(asin.relabun.class.factors.melt, variable == "Bacteria_Proteobacteria_Deltaproteobacteria")
+```
+
+Run the lmer model for each Class Level taxa:
+```{r}
+lmer.bacteroidia <- lmer(value ~ w_k + (1|kelpbed_time), bacteroidia)
+lmer.gamma <- lmer(value ~ w_k + (1|kelpbed_time), gammaprot)
+lmer.alpha <- lmer(value ~ w_k + (1|kelpbed_time), alpha)
+lmer.plancto <- lmer(value ~ w_k + (1|kelpbed_time), plancto)
+lmer.verruco <- lmer(value ~ w_k + (1|kelpbed_time), verruco)
+lmer.oxyphoto <- lmer(value ~ w_k + (1|kelpbed_time), oxyphoto)
+lmer.delta <- lmer(value ~ w_k + (1|kelpbed_time), delta)
+```
+
+Summarize the results from these models:
+```{r}
+summary(lmer.bacteroidia)
+summary(lmer.gamma)
+summary(lmer.alpha)
+summary(lmer.plancto)
+summary(lmer.verruco)
+summary(lmer.oxyphoto)
+summary(lmer.delta)
+```
+
+Results from Class level Water v Kelp
+The results from the lmer analysis suggest that 4 of the five most abundance Class level taxa are significantly different across water and kelp samples, accounting for the variance of kelpbed_time (sampling occasion). More specifically, we see significant enhancement of Gammas and Planctos on kelp blades, and significant reduction of Alphas and Oxyphotos, compared with water samples (p vals < 0.05, lmer).
+
+*Class Level Analysis by Laminae Condition (healthy v bryozoan)*
+
+Melt asin transformed relative abundance dataframe using Class level df and df that INCLUDES water samples:
+```{r}
+asin.relabun.class.factors.kelp.melt <- reshape2::melt(asin.relabun.class.factors.kelp, id = c("sample.id", "exp", "w_k", "filt_type", "phys_state", "exp_phys_state", "mock_neg", "kelpbed_time"))
+```
+
+Filter specific Classes from dataframe (I chose the top Classes exhibiting > 3% relative abundance):
+```{r}
+bacteroidia.kelp <- filter(asin.relabun.class.factors.kelp.melt, variable == "Bacteria_Bacteroidetes_Bacteroidia")
+
+gammaprot.kelp <- filter(asin.relabun.class.factors.kelp.melt, variable == "Bacteria_Proteobacteria_Gammaproteobacteria")
+
+alpha.kelp <- filter(asin.relabun.class.factors.kelp.melt, variable == "Bacteria_Proteobacteria_Alphaproteobacteria")
+
+plancto.kelp <- filter(asin.relabun.class.factors.kelp.melt, variable == "Bacteria_Planctomycetes_Planctomycetacia")
+
+verruco.kelp <- filter(asin.relabun.class.factors.kelp.melt, variable == "Bacteria_Verrucomicrobia_Verrucomicrobiae")
+
+oxyphoto.kelp <- filter(asin.relabun.class.factors.kelp.melt, variable == "Bacteria_Cyanobacteria_Oxyphotobacteria")
+
+delta.kelp <- filter(asin.relabun.class.factors.kelp.melt, variable == "Bacteria_Proteobacteria_Deltaproteobacteria")
+```
+
+Run the lmer model for each Class Level taxa:
+```{r}
+lmer.bacteroidia.kelp <- lmer(value ~ phys_state + (1|kelpbed_time), bacteroidia.kelp)
+lmer.gamma.kelp <- lmer(value ~ phys_state + (1|kelpbed_time), gammaprot.kelp)
+lmer.alpha.kelp <- lmer(value ~ phys_state + (1|kelpbed_time), alpha.kelp)
+lmer.plancto.kelp <- lmer(value ~ phys_state + (1|kelpbed_time), plancto.kelp)
+lmer.verruco.kelp <- lmer(value ~ phys_state + (1|kelpbed_time), verruco.kelp)
+lmer.oxyphoto.kelp <- lmer(value ~ phys_state + (1|kelpbed_time), oxyphoto.kelp)
+lmer.delta.kelp <- lmer(value ~ phys_state + (1|kelpbed_time), delta.kelp)
+```
+
+Summarize the results from these models:
+```{r}
+summary(lmer.bacteroidia.kelp)
+summary(lmer.gamma.kelp)
+summary(lmer.alpha.kelp)
+summary(lmer.plancto.kelp)
+summary(lmer.verruco.kelp) 
+summary(lmer.oxyphoto.kelp)
+summary(lmer.delta.kelp)
+```
+
+
+# Workflow - Kim MacFarland
+
+Using workflow developed by Kim MacFarland to develop nMDS plots for manuscript: https://rpubs.com/dillmcfarlan/R_microbiotaSOP
+
+## 1. Load appropriate data files
+
+Need to load arcsine square root transformed relative abundance table (in Kim's tutorial this is referred to as the *OTU table*), with taxa ids as columns and sample ids as rows. Conducting this analysis by ASV.
+
+Df with taxa ids as columns and sample ids as rows:
+ASV: asin.asv.tr
+Family: asin.fam.tr
+```{r}
+# note, these sample ids have 'asinsqrt_' before sample name (need to mimic in meta df)
+FAM.clean <- asin.fam.tr # by fam
+ASV.clean <- asin.asv.tr # by asvs
+```
+
+Load appropriate *Taxonomy table*
+Want df with all levels of taxonomy but including only unique taxa ids (class_order_fam, or k_p)
+```{r}
+# taxonomy of ASV.clean
+# Use asvs_bact_arch_counts_taxa bc it has already had eukaryotes, mitochondria, and chloroplasts removed.
+# 1. need to make taxa.ids row labels
+# 2. remove all taxa.ids that don't occur in ASV.clean data set
+tax.asv <- asvs_bact_arch_counts_taxa %>%
+  column_to_rownames(var = "rowname")
+tax.asv <- select(tax.asv, Kingdom, Phylum, Class, Order, Family, Genus)
+
+# Family
+# unique.taxa.df is df of unique family level taxa and amalgam taxonomy names (k_p, c_o_f)
+# 1. need to make taxa.ids row labels
+# 2. remove all taxa.ids that don't occur in FAM.clean data set
+tax <- unique.taxa.df %>% remove_rownames %>%
+  column_to_rownames(var = "taxa.ids")
+tax.clean <- tax[row.names(tax) %in% colnames(FAM.clean),]
+```
+
+*Metadata Table*
+```{r}
+# should be able to use for both FAM.clean and ASV.clean
+# 1. Remove "na" samples from asin.sample.id row (mock comm and neg controls)
+# 2. Make row.names = sample ids with 'asinsqrt_' prefix to match ASV/FAM table
+# 3. Drop levels of factors from pre-subset df (eye-roll...)
+meta <- sample_info_tab %>% filter(asin.sample.id != "na")
+meta <- meta %>% remove_rownames %>%
+  column_to_rownames(var = "asin.sample.id")
+meta[] <- lapply(meta, function(x) if(is.factor(x)) factor(x) else x)
+```
+
+
+## 2. Order the data
+
+To make viewing and using the data easier, make sure tables have samples (rows) in same order. Since, FAM.clean and meta have sample names as row names, order by these.
+
+```{r}
+ASV.clean <- ASV.clean[order(row.names(ASV.clean)),]
+meta <- meta[order(row.names(meta)),]
+```
+
+## 3. Create distinct datasets of counts based on groups
+
+```{r}
+# 1. Subset metadata by distinct samples
+# metadata for kelp samples
+meta.kelp <- meta %>% 
+  rownames_to_column('taxa.ids') %>%
+  filter(w_k == "k") %>%
+  column_to_rownames('taxa.ids')
+meta.kelp[] <- lapply(meta.kelp, function(x) if(is.factor(x)) factor(x) else x) # remove extra factors dropped from subsetting
+
+# metadata for AQ samples:
+meta.aq <- meta %>% 
+  rownames_to_column('taxa.ids') %>%
+  filter(loc.in.bed != "na") %>%
+  column_to_rownames('taxa.ids')
+meta.aq[] <- lapply(meta.aq, function(x) if(is.factor(x)) factor(x) else x) # remove extra factors dropped from subsetting
+
+# 2. Subset ASV.clean by:
+# kelp samples
+ASV.kelp <- ASV.clean[row.names(ASV.clean) %in% row.names(meta.kelp),]
+
+# AQ samples (kelp04 & kelp05)
+ASV.aq <- ASV.clean[row.names(ASV.clean) %in% row.names(meta.aq),]
+```
+
+## 4. Alpha and Beta Diversity
+
+*A. Alpha Diversity*
+
+Within sample diversity using asin squareroot transformed ASV relative abundance.
+```{r alpha diversity}
+
+div <- as.data.frame(diversity(ASV.kelp, index = "shannon"))
+div.merge <- cbind(div, meta.kelp$phys_state)
+
+#plot diversity
+ggplot(data = div.merge, 
+       aes(x=meta.kelp$phys_state, y=diversity(ASV.kelp,index="shannon"))) +
+  geom_boxplot(aes(color = meta.kelp$phys_state)) + 
+  xlab('phys_state') +
+  ylab('Diversity')
+
+# run aov on diveristy values for bryo versus healthy blades:
+div.stats <- aov(diversity(ASV.kelp,index="shannon") ~ meta.kelp$phys_state, data = div.merge)
+summary(div.stats) # p value 0.00234
+```
+
+
+*B. Beta-diversity*
+
+Between sample diversity - it is how different every sample is from every other sample. Thus, each sample has more than one value. Some metrics take abundance into account (i.e. Bray-Curtis, weighted UniFrac) and some only calculate based on presence-absence (i.e. richness: Jaccard, unweighted UniFrac)
+
+### nMDS
+Best way to visualize beta-diversity, or how diff samples are from each other, is by nMDS.
+
+Calculate nMDS values for a 2-axis `k=2` graph using the Bray-Curtis metric that takes into account both the presence/absence and abundance of OTUs (taxa.ids) in the samples (i.e. diversity).
+
+```{r conduct nmds}
+# conduct nMDS
+# all samples (exluding mock comm and neg control)
+taxa.ids.nmds <- metaMDS(ASV.clean, distance = "bray", k=2, trymax = 1000)
+
+# only kelp samples - use ASV.kelp
+kelp.asv.nmds <- metaMDS(ASV.kelp, distance = "bray", k=2)
+
+# only AQ samples - use ASV.kelp
+aq.asv.nmds <- metaMDS(ASV.aq, distance = "bray", k=2, trymax = 1000)
+```
+
+Plot nMDS with different colors based on factors
+```{r plot nmds}
+##################  
+# ALL KELP & WATER SAMPLES - use taxa.ids.nmds
+################## 
+# create blank plots
+plot(taxa.ids.nmds, 
+     type = "n", 
+     main = "Bray-Curtis", 
+     ylim = c(-1, 1),
+     xlim = c(-1, 1))
+# add points - will have issues coloring points if extra factors aren't dropped from subsetted df
+points(taxa.ids.nmds, 
+       display = "sites", 
+       pch = 20, 
+       col=c("orange", "blue")[meta$w_k])
+legend(-2, 0, 
+       legend = c("k", "w"), 
+       col=c("orange", "blue"), 
+       pch=20)
+
+##################
+# KELP SAMPLES ONLY - use kelp.fam(or asv).nmds and meta.kelp
+################### 
+plot(kelp.asv.nmds, 
+     type = "n", 
+     main = "Bray-Curtis",
+     ylim = c(-2, 3),
+     xlim = c(-3, 2))
+# add points - will have issues coloring points if extra factors aren't dropped from subsetted df
+points(kelp.asv.nmds, 
+       display = "sites", 
+       pch = 20, 
+       col=c("grey", "orange")[meta.kelp$phys_state])
+legend(-5, 0, 
+       legend = c("bryozoan", "healthy"), 
+       col=c("grey", "orange"), 
+       pch=20)
+```
+
+### Fitting ASV.kelp to nMDS
+
+To add arrows for specific ASVs within the plot
+```{r Add arrows for ASVs to nmds}
+#### Fit ASVs to nMDS plot (these are ASVs that I chose from the DESeq analysis that were >= 0.5% relative abundance and significantly different by phys_state)
+fit.nmds.ASV.shewanella <- envfit(kelp.asv.nmds, ASV.kelp$TACGAGGGGTGCAAGCGTTAATCGGAATTACTGGGCGTAAAGCGTACGCAGGCGGTTTGTTAAGCGAGATGTGAAAGCCCCGGGCTCAACCTGGGAACTGCATTTCGAACTGGCAAACTAGAGTCTTGTAGAGGGGGGTAGAATTTCAGGTGTAGCGGTGAAATGCGTAGAGATCTGAAGGAATACCGGTGGCGAAGGCGGCCCCCTGGACAAAGACTGACGCTCAGGTACGAAAGCGTGGGGAGCAAACAGG)
+
+fit.nmds.ASV.arenicella <- envfit(kelp.asv.nmds, ASV.kelp$TACGGAGGGTGCAAGCGTTAATCGGAATTACTGGGCGTAAAGCGCGCGTAGGTGGTTGTTTAAGTTAGATGTGAAAGCCCTGGGCTTAACCTAGGAACTGCATTTAATACTGGGCAACTAGAGTATGGTAGAGGGAAGTGGAATTCCACATGTAGCGGTGAAATGCGTAGAGATGTGGAGGAACACCAGTGGCGAAGGCGACTTCCTGGACCAATACTGACACTGAGGTGCGAAAGCGTGGGGAGCAAACAGG)
+
+fit.nmds.ASV.naCryomorphaceae <- envfit(kelp.asv.nmds, ASV.kelp$TACGGAGGATCCAAGCGTTATCCGGATTTATTGGGTTTAAAGGGTCCGTAGGCGGGAAAGTCAGTCAGTGGTGAAATCCTATAGCTTAACTATAGCACTGCCATTGATACTGCTTTTCTTGAATTAAGTTGAAGTGGGCGGAATGTGTCATGTAGCGGTGAAATGCATAGATATGACACAGAACACCGATTGCGAAGGCAGCTCACTAAGTTTATATTGACGCTGATGGACGAAAGCGTGGGTAGCGAACAGG)
+
+# ASVs that were more abundant on healthy blades
+
+fit.nmds.ASV.alteromonas <- envfit(kelp.asv.nmds, ASV.kelp$TACGGAGGGTGCGAGCGTTAATCGGAATTACTGGGCGTAAAGCGCACGCAGGCGGTTTGTTAAGCTAGATGTGAAAGCCCCGGGCTCAACCTGGGATGGTCATTTAGAACTGGCAGACTAGAGTCTTGGAGAGGGGAGTGGAATTCCAGGTGTAGCGGTGAAATGCGTAGATATCTGGAGGAACATCAGTGGCGAAGGCGACTCCCTGGCCAAAGACTGACGCTCATGTGCGAAAGTGTGGGTAGCGAACAGG)
+
+fit.nmds.ASV.arenicella.up <- envfit(kelp.asv.nmds, ASV.kelp$TACGGAGGGTGCAAGCGTTAATCGGAATTACTGGGCGTAAAGCGCGCGTAGGTGGTTTGGTAAGTTAGATGTGAAAGCCCTGGGCTTAACCTGGGAACTGCATTTAAAACTGTCAGACTAGAGTATGGTAGAGGGAAGTGGAATTCCACATGTAGCGGTGAAATGCGTAGAGATGTGGAGGAACACCAGTGGCGAAGGCGACTTCCTGGACCAATACTGACACTGAGGTGCGAAAGCGTGGGGAGCAAACAGG)
+
+fit.nmds.ASV.blastopirellula1 <- envfit(kelp.asv.nmds, ASV.kelp$TACGAACTGTGCAAACGTTATTCGGAATCACTGGGCTTAAAGGGTGCGTAGGCGGGTTTATAGGTCAGATGTGAAAGCCCACGGCTCAACCGTGGAATTGCGTTTGAAACCATAAGTCTTGAGGGGATCAGAGGAGAGCGGAACTGATGGTGGAGCGGTGAAATGCGTTGATATCATCAGGAACACCGGTGGCGAAAGCGGCTCTCTGGGATCTTTCTGACGCTGAGGCACGAAAGCTAGGGGAGCGAACGGG)
+
+fit.nmds.ASV.blastopirellula2 <- envfit(kelp.asv.nmds, ASV.kelp$TACGAACTGTGCAAACGTTATTCGGAATCACTGGGCTTAAAGGGTGCGTAGGCGGATTTGTAGGTCAGATGTGAAAGCCCACGGCTCAACCGTGGAATTGCGTTTGAAACCACAAGTCTTGAGGAAGTCAGAGGTATGCGGAACTGATGGTGGAGCGGTGAAATGTGTTGATATCATCAGGAACACCGGTGGCGAAAGCGGCATACTGGGACTTTTCTGACGCTGAGGCACGAAAGCTAGGGGAGCGAACGGG)
+
+fit.nmds.ASV.blastopirellula3 <- envfit(kelp.asv.nmds, ASV.kelp$TACGAACTGTGCAAACGTTATTCGGAATCACTGGGCTTAAAGGGTGCGTAGGCGGGTTTATAGGTCAGATGTGAAAGCCCACGGCTCAACCGTGGAATTGCGTTTGAAACCATAAGCCTTGAGGGGATCAGAGGAGAGCGGAACTGATGGTGGAGCGGTGAAATGCGTTGATATCATCAGGAACACCGGTGGCGAAAGCGGCTCTCTGGGATCTTTCTGACGCTGAGGCACGAAAGCTAGGGGAGCGAACGGG)
+
+fit.nmds.ASV.blastopirellula4 <- envfit(kelp.asv.nmds, ASV.kelp$TACGAACTGTGCAAACGTTATTCGGAATCACTGGGCTTAAAGGGTGCGTAGGCGGGTTTATAGGTCAGATGTGAAAGCCCACGGCTCAACCGTGGAATTGCGTTTGAAACCATAAGTCTTGAGGGGATCAGAGGAGAGCGGAACTGATGGTGGAGCGGTGAAATGCGTTGATATCATCAGGAACACCGGTGGCGAAAGCGGCTCTCTGGGATCTTTCTGACGCTGAGTCACGAAAGCTAGGGGAGCGAACGGG)
+
+fit.nmds.ASV.granulo1 <- envfit(kelp.asv.nmds, ASV.kelp$TACGGAGGGTGCAAGCGTTAATCGGAATTACTGGGCGTAAAGCGCGCGTAGGCGGCTAGGTCAGTCAGATGTGAAATCCCCGGGCTCAACCTGGGAACTGCATTTGATACTGCCTAGCTAGAGTATGTTAGAGGAATGCGGAATTCCAGGTGTAGCGGTGAAATGCGTAGATATCTGGAGGAACATCAGTGGCGAAGGCGGCATTCTGGAACAATACTGACGCTGAGGTGCGAAAGCGTGGGGAGCAAACAGG)
+
+fit.nmds.ASV.granulo2 <- envfit(kelp.asv.nmds,ASV.kelp$TACGGAGGGTGCAAGCGTTAATCGGAATTACTGGGCGTAAAGCGCGCGTAGGCGGCTTGGTCAGTCAGATGTGAAATCCCAGGGCTCAACCTTGGAACTGCATTTGATACTGCCAGGCTAGAGTATGTTAGAGGAAAGCGGAATTCCGGGTGTAGCGGTGAAATGCGTAGATATCCGGAGGAACATCAGTGGCGAAGGCGGCTTTCTGGAACAATACTGACGCTGAGGTGCGAAAGCGTGGGGAGCAAACAGG)
+
+fit.nmds.ASV.granulo3 <- envfit(kelp.asv.nmds,ASV.kelp$TACTAAAGGTGCGAGCGTTAATCGGAATTACTGGGCGTAAAGCGCGCGTAGGCGGTTTGACAAGTTGGATGTGAAATCCCCGAGCTCAACTCGGGAACTGCATTCAAAACTGTCAGGCTAGAGTGTGTAAGAGGATAGTGGAATTCCAGGTGTAGCGGTGAAATGCGTAGATATCTGGAGGAACATCAGTGGCGAAGGCGACTATCTGGTACAACACTGACGCTGAGGTGCGAAAGCGTGGGGAGCAAACAGG)
+
+fit.nmds.ASV.lewinella <- envfit(kelp.asv.nmds,ASV.kelp$TACGGAGGGTGCAAGCGTTATCCGGAATTACTGGGTTTAAAGGGTGCGTAGGCCGTCTAATAAGTCAGTGGTGAAAAGTCTGGGCTCAACCGAGGCCTTGCCATTGAAACTGTTAGACTTGAAATAAGTTGAGGTAGGCGGAATGTGACATGTAGCGGTGAAATGCATAGATATGTCATAGAACACCAATTGCGAAGGCAGCTTACTAGACTTCATTTGACGCTGAGGCACGAAAGCGTGGGGAGCGAACGGG)
+
+fit.nmds.ASV.literomonas1 <- envfit(kelp.asv.nmds,ASV.kelp$TACGGAGGGGGCTAGCGTTGTTCGGAATTACTGGGCGTAAAGCGTGCGTAGGCGGATCAATAAGTAAGGGGTGAAATCCCGAGGCTCAACCTCGGAACTGCCCTTTAAACTGTTGGTCTTGAGTTCTGGAGAGGTGAGTGGAATTGCTAGTGTAGAGGTGAAATTCGTAGATATTAGCAGGAACACCAGAGGCGAAGGCGGCTCACTGGACAGATACTGACGCTGAGGCACGAAAGTGTGGGGAGCAAACAGG)
+
+fit.nmds.ASV.literomonas2 <- envfit(kelp.asv.nmds,ASV.kelp$TACGGAGGGGGCTAGCGTTGTTCGGAATTACTGGGCGTAAAGCGTGCGTAGGCGGACTATTAAGTTAGATGTGAAATCCCAGGGCTCAACCCTGGAACTGCATTTAAAACTGGTAGTCTTGAGTTCTGGAGAGGTAAGTGGAATTCCTAGTGTAGAGGTGAAATTCGTAGATATTAGGAGGAACACCAGAGGCGAAGGCGGCTTACTGGACAGATACTGACGCTGAGGCACGAAAGTGTGGGTAGCAAACAGG)
+
+fit.nmds.ASV.persicirhadbdus1 <- envfit(kelp.asv.nmds,ASV.kelp$TACGAAGGTCCCGAGCGTTATTCGGAATCACTGGGCGTAAAGAGTACGTAGGCGGTTTGGTAAGTCAGGTGTGAAATCCCGGAGCTCAACTCCGGAACTGCACCCGATACTGCTAGACTGGAGTAATGGAGGGGCAGGTGGAATTCTCGGTGTAGCAGTGAAATGCGTGGATATCGAGAGGAAGACCAATGGCGAAGGCAGCCTGCTGGACATTTACTGACGCTGAGGTACGAAGGCTAGGGTAGCGAAAGGG)
+
+fit.nmds.ASV.persicirhadbdus2 <- envfit(kelp.asv.nmds,ASV.kelp$TACGAAGGTCCCGAGCGTTATTCGGAATCACTGGGCGTAAAGAGTACGTAGGCGGTTTGGTAAGTCAGGTGTGAAATCCCGGAGCTCAACTCCGGAACTGCATCCGATACTGCTAGACTGGAGTAATGGAGGGGCAGGTGGAATTCTCGGTGTAGCAGTGAAATGCGTGGATATCGAGAGGAAGACCAATGGCGAAGGCAGCCTGCTGGACATTTACTGACGCTGAGGTACGAAGGCTAGGGTAGCGAAAGGG)
+
+fit.nmds.ASV.persicirhadbdus3 <- envfit(kelp.asv.nmds,ASV.kelp$TACGAAGGTCCCGAGCGTTATTCGGAATCACTGGGCGTAAAGAGTACGTAGGCGGTTTGGTAAGTCAGGTGTGAAATCCCAGAGCTCAACTCTGGAACTGCATCCGATACTGCCAGACTAGAGTAATGGAGGGGCAGGTGGAATTCTCGGTGTAGCAGTGAAATGCGTGGATATCGAGAGGAAGACCAATGGCGAAGGCAGCCTGCTGGACATTTACTGACGCTGAGGTACGAAGGCTAGGGTAGCAAAAGGG)
+
+fit.nmds.ASV.roseibacillus1 <- envfit(kelp.asv.nmds,ASV.kelp$TACGAAGGTCCCAAGCGTTGTTCGGAATAACTGGGCGTAAAGCGTGTGTAGGCTGCGCGGAAAGTCAGATGTGAAAGCCCGGGGCTCAACCTCGGAACTGCACCTGATACTCCCGTGCTAGAGTAATGGAGAGGTAAGTGGAATTCTCGGTGTAGCAGTGAAATGCGTAGATATCGAGAGGAACATCAATGGCGAAGGCAACTTACTGGACATTTACTGACGCTCAGACACGAAGGCTAGGGGAGCGAAAGGG)
+
+fit.nmds.ASV.roseibacillus2 <- envfit(kelp.asv.nmds,ASV.kelp$TACGAAGGTCCCAAGCGTTGTTCGGAATAACTGGGCGTAAAGCGTGTGTAGGCTGCGCGGAAAGTCGGATGTGAAAGCCCAAGGCTCAACCTTGGAACTGCATCCGATACTCCCGTGCTAGAGTAATGGAGAGGTAAGTGGAATTCTCGGTGTAGCAGTGAAATGCGTAGATATCGAGAGGAACATCAATGGCGAAGGCAACTTACTGGACATTTACTGACGCTCAGACACGAAGGCTAGGGGAGCGAAAGGG)
+
+fit.nmds.ASV.rubritalea1 <- envfit(kelp.asv.nmds, ASV.kelp$TACGAAGGTCCCGAGCGTTATTCGGAATCACTGGGCGTAAAGGGAGCGTAGGCGGCGCGGTAAGTCAGATGTGAAAGCCCAAGGCTCAACCTTGGAACTGCATTCGATACTGCCGTGCTAGAGTAATGGAGAGGTAAATGGAATTTTGGGTGTAGCAGTGAAATGCGTAGATATCCAAAGGAAGACCAATGGCGAAGGCAATTTACTGGACATTTACTGACGCTGAGGCTCGAAGGCTAGGGTAGCGAAAGGG)
+
+fit.nmds.ASV.sulfitobacter <- envfit(kelp.asv.nmds, ASV.kelp$TACGGAGGGGGCTAGCGTTGTTCGGAATTACTGGGCGTAAAGCGTACGTAGGCGGATCAGAAAGTATGGGGTGAAATCCCGGGGCTCAACCCCGGAACTGCCTCATAAACTCCTGGTCTTGAGTTCGAGAGAGGTGAGTGGAATTCCAAGTGTAGAGGTGAAATTCGTAGATATTTGGAGGAACACCAGTGGCGAAGGCGGCTCACTGGCTCGATACTGACGCTGAGGTACGAAAGTGTGGGGAGCAAACAGG)
+
+fit.nmds.ASV.cryomorphaceae.na <- envfit(kelp.asv.nmds, ASV.kelp$TACGGAGGGTCCAAGCGTTATCCGGATTTATTGGGTTTAAAGGGTACGTAGGCGGAAGATTAAGTCAGTAGTGAAAGCCCATCGCTCAACGATGGAACTGCTATTGATACTGATTTTCTTGAATATAGTTGAAGTAGGCGGAATACGGCATGTAGCGGTGAAATGCATAGATATGCCGTGGAACACCAATCGCGAAGGCAGCTTACTAAGCTACTATTGACGCTAAGGTACGAAAGCGTGGGGAGCGAACAGG)
+
+fit.nmds.ASV.rubritaleaceae.na <- envfit(kelp.asv.nmds, ASV.kelp$TACGAAGGTCCCAAGCGTTATTCGGAATCACTGGGCGTAAAGGGAGCGTAGGCGGCGTGGAAAGTCAGATGTGAAAGCCCAAGGCTCAACCTTGGAACTGCATCCGATACTCCCACGCTAGAGGACTGGAGAGGTGTTTGGAATTTTCGGTGTAGCAGTGAAATGCGTAGAGATCGAAAGGAAGACCAATGGCGAAGGCAGAACACTGGACAGTACCTGACGCTGAGGCTCGAAGGCTAGGGGAGCGAAAGGG)
+
+fit.nmds.ASV.saprospiraceae.na1 <- envfit(kelp.asv.nmds, ASV.kelp$TACGGAGGGTGCAAGCGTTATCCGGAATCACTGGGTTTAAAGGGTGCGTAGGCGGCATCACAAGTCAGAGGTGAAAGCCCATCGCTTAACGATGGAACTGCCTTTGAAACTGTGGAGCTTGAATTAGGTTGAGGTTAGCGGAATGTGACATGTAGCGGTGAAATGCATAGATATGTCATAGAACACCAATTGCGAAGGCAGCTGGCTGAGCCTTAATTGACGCTGAGGCACGAAAGCGTGGGGAGCGAACAGG)
+
+fit.nmds.ASV.saprospiraceae.na2 <- envfit(kelp.asv.nmds, ASV.kelp$TACGGAGGATGCAAGCGTTATCCGGAATCACTGGGTTTAAAGGGTGCGCAGGCGGATTAATAAGTCAGAGGTGAAAGCTCTCAGCTTAACTGAGGAACTGCCTTTGATACTGTTAGTCTTGAAATATGGTGAGGTTGGCGGAATGAGTCATGTAGCGGTGAAATGCATAGATATGACTTAGAACACCGATTGCGAAGGCAGCTAACTGGCCATTATTTGACGCTCAGGCACGAAAGCGTGGGGAGCGAACAGG)
+```
+
+Plot nMDS with overlaying vectors
+*Note that the vectors are plotted on a different scale (not arcsine transformed so the direction is correct but not the length of the vector):*
+
+```{r}
+plot(kelp.asv.nmds, type = "n", main = "Bray-Curtis")
+# add points - will have issues coloring points if extra factors aren't dropped from subsetted df
+points(kelp.asv.nmds, display = "sites", pch = 20, col=c("grey", "orange")[meta.kelp$phys_state])
+# add legend
+#legend(-3, 0, legend = c("bryo", "healthy"), col=c("grey", "orange"), pch=20)
+plot(fit.nmds.ASV.shewanella, col = "#333333") # black
+plot(fit.nmds.ASV.arenicella, col = "#706c61") # dark grey
+plot(fit.nmds.ASV.naCryomorphaceae, col = "grey") # light grey
+
+# add vectors for top diff abundant helthy asvs -- need 13 colors
+plot(fit.nmds.ASV.alteromonas, col = "#ffe196") # light yellow
+plot(fit.nmds.ASV.arenicella.up, col = "#fdd365") # slightly darker yellow
+plot(fit.nmds.ASV.blastopirellula1, col = "#e32249") # fuscia 
+plot(fit.nmds.ASV.blastopirellula2, col = "#e32249")
+plot(fit.nmds.ASV.blastopirellula3, col = "#e32249")
+plot(fit.nmds.ASV.blastopirellula4, col = "#e32249")
+plot(fit.nmds.ASV.granulo1, col = "#ce0f3d") # dark red
+plot(fit.nmds.ASV.granulo2, col = "#ce0f3d")
+plot(fit.nmds.ASV.granulo3, col = "#ce0f3d")
+plot(fit.nmds.ASV.lewinella, col = "#f8b195") # 
+plot(fit.nmds.ASV.literomonas1, col = "#ffd082") # 
+plot(fit.nmds.ASV.literomonas2, col = "#ffd082")
+plot(fit.nmds.ASV.persicirhadbdus1, col = "#ffae8f") # 
+plot(fit.nmds.ASV.persicirhadbdus2, col = "#ffae8f")
+plot(fit.nmds.ASV.persicirhadbdus3, col = "#ffae8f")
+plot(fit.nmds.ASV.roseibacillus1, col = "#ce0f3d") # 
+plot(fit.nmds.ASV.roseibacillus2, col = "#ce0f3d")
+plot(fit.nmds.ASV.rubritalea1, col = "#c81912") # 
+plot(fit.nmds.ASV.sulfitobacter, col = "#ff5d6c") # 
+plot(fit.nmds.ASV.cryomorphaceae.na, col = "orange") # 
+plot(fit.nmds.ASV.rubritaleaceae.na, col = "#f0134d") # 
+plot(fit.nmds.ASV.saprospiraceae.na1, col = "#fddb3a") # 
+plot(fit.nmds.ASV.saprospiraceae.na2, col = "#fddb3a") # 
+```
+
+
+Summing to higher levels and replotting
+```{r}
+# Extract all ASVs by desired FAM
+ASV.hypho <- ASV.kelp[,tax.asv$Family == "Hyphomonadaceae"]
+ASV.cyclo <- ASV.kelp[,tax.asv$Family == "Cyclobacteriaceae"]
+ASV.flavo <- ASV.kelp[,tax.asv$Family == "Flavobacteriaceae"]
+ASV.thiohal <- ASV.kelp[,tax.asv$Family == "Thiohalorhabdaceae"]
+ASV.thiotricha <- ASV.kelp[,tax.asv$Family == "Thiotrichaceae"]
+ASV.pirellu <- ASV.kelp[,tax.asv$Family == "Pirellulaceae"]
+ASV.rubritele <- ASV.kelp[,tax.asv$Family == "Rubritaleaceae"]
+ASV.burkh <- ASV.kelp[,tax.asv$Family == "Burkholderiaceae"]
+ASV.shew <- ASV.kelp[,tax.asv$Family == "Shewanellaceae"]
+# taxa that make up less than 3% relative abundance of Family level
+ASV.micro <- ASV.kelp[,tax.asv$Family == "Microscillaceae"]
+ASV.hali <- ASV.kelp[,tax.asv$Family == "Halieaceae"]
+ASV.punice <- ASV.kelp[,tax.asv$Family == "Puniceicoccaceae"]
+
+# Sum the abundances of the ASVs summed to Family level into one variable (column)
+ASV.hypho$hypho.sum <- rowSums(ASV.hypho)
+ASV.cyclo$cyclo.sum <- rowSums(ASV.cyclo)
+ASV.flavo$flavo.sum <- rowSums(ASV.flavo)
+ASV.thiohal$thioha.sum <- rowSums(ASV.thiohal)
+ASV.thiotricha$thiotricha.sum <- rowSums(ASV.thiotricha)
+ASV.pirellu$pirellu.sum <- rowSums(ASV.pirellu)
+ASV.rubritele$rubritele.sum <- rowSums(ASV.rubritele)
+ASV.burkh$burkh.sum <- rowSums(ASV.burkh)
+ASV.shew$shew.sum <- rowSums(ASV.shew)
+# taxa that make up less than 3% relative abundance of Family level
+ASV.micro$micro.sum <- rowSums(ASV.micro)
+ASV.hali$hali.sum <- rowSums(ASV.hali)
+ASV.punice$punice.sum <- rowSums(ASV.punice)
+
+# Fit the new groups
+fit.nmds.hypho <- envfit(kelp.asv.nmds, ASV.hypho$hypho.sum)
+fit.nmds.cyclo <- envfit(kelp.asv.nmds, ASV.cyclo$cyclo.sum)
+fit.nmds.flavo <- envfit(kelp.asv.nmds, ASV.flavo$flavo.sum)
+fit.nmds.thioha <- envfit(kelp.asv.nmds, ASV.thiohal$thioha.sum)
+fit.nmds.thiotricha <- envfit(kelp.asv.nmds, ASV.thiotricha$thiotricha.sum)
+fit.nmds.punice <- envfit(kelp.asv.nmds, ASV.punice$punice.sum)
+fit.nmds.rubritele <- envfit(kelp.asv.nmds, ASV.rubritele$rubritele.sum)
+fit.nmds.burkh <- envfit(kelp.asv.nmds, ASV.burkh$burkh.sum)
+fit.nmds.shew <- envfit(kelp.asv.nmds, ASV.shew$shew.sum)
+# taxa that make up less than 3% relative abundance of Family level
+fit.nmds.micro <- envfit(kelp.asv.nmds, ASV.micro$micro.sum)
+fit.nmds.hali <- envfit(kelp.asv.nmds, ASV.hali$hali.sum)
+fit.nmds.pirellu <- envfit(kelp.asv.nmds, ASV.pirellu$pirellu.sum)
+
+# Check fit
+fit.nmds.rubritele
+
+# Plot
+plot(kelp.asv.nmds, 
+     type = "n", 
+     main = "Bray-Curtis", 
+     xlim = c(-3, 2),
+     ylim = c(-2, 3))
+# add points - will have issues coloring points if extra factors aren't dropped from subsetted df
+points(kelp.asv.nmds, 
+       display = "sites", 
+       pch = 20, 
+       col=c("grey", "orange")[meta.kelp$phys_state])
+#legend(-5, 0, 
+       #legend = c("bryozoan", "healthy"), 
+       #col=c("grey", "orange"), 
+      # pch=20)
+
+#Add fitted variables
+plot(fit.nmds.hypho, col="black", labels=c("Hypho"), axis = FALSE, add = TRUE)
+plot(fit.nmds.cyclo, col="black", labels=c("Cyclo"))
+plot(fit.nmds.flavo, col="black", labels=c("Flavo"))
+plot(fit.nmds.thioha, col="black", labels=c("Thioha"))
+plot(fit.nmds.thiotricha, col="black", labels=c("Thiotricha"))
+plot(fit.nmds.pirellu, col="black", labels=c("Pirellu"))
+plot(fit.nmds.rubritele, col="black", labels=c("Rubritele"))
+plot(fit.nmds.burkh, col="black", labels=c("Burkh"))
+plot(fit.nmds.shew, col="black", labels=c("Shew"))
+
+# less than 3% relative abundance at Family level
+plot(fit.nmds.micro, col="black", labels=c("Micro"))
+plot(fit.nmds.hali, col="black", labels=c("Hali"))
+plot(fit.nmds.punice, col="black", labels=c("Punice"))
+```
